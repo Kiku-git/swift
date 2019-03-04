@@ -30,6 +30,7 @@ import ArraySubscript
 import BinaryFloatingPointConversionFromBinaryInteger
 import BinaryFloatingPointProperties
 import BitCount
+import Breadcrumbs
 import ByteSwap
 import COWTree
 import COWArrayGuaranteedParameterOverhead
@@ -43,6 +44,7 @@ import CharacterLiteralsSmall
 import CharacterProperties
 import Chars
 import ClassArrayGetter
+import Codable
 import Combos
 import DataBenchmarks
 import DeadArray
@@ -53,14 +55,16 @@ import DictTest3
 import DictTest4
 import DictTest4Legacy
 import DictionaryBridge
+import DictionaryBridgeToObjC
+import DictionaryCompactMapValues
 import DictionaryCopy
 import DictionaryGroup
 import DictionaryKeysContains
 import DictionaryLiteral
+import DictionaryOfAnyHashableStrings
 import DictionaryRemove
 import DictionarySubscriptDefault
 import DictionarySwap
-import DoubleWidthDivision
 import DropFirst
 import DropLast
 import DropWhile
@@ -68,11 +72,12 @@ import ErrorHandling
 import Exclusivity
 import ExistentialPerformance
 import Fibonacci
+import FlattenList
 import FloatingPointPrinting
 import Hanoi
 import Hash
-import HashQuadratic
 import Histogram
+import InsertCharacter
 import Integrate
 import IterateData
 import Join
@@ -90,10 +95,12 @@ import NSError
 import NSStringConversion
 import NopDeinit
 import ObjectAllocation
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
 import ObjectiveCBridging
 import ObjectiveCBridgingStubs
-#if !SWIFT_PACKAGE
+#if !(SWIFT_PACKAGE || Xcode)
 import ObjectiveCNoBridgingStubs
+#endif
 #endif
 import ObserverClosure
 import ObserverForwarderStruct
@@ -101,7 +108,6 @@ import ObserverPartiallyAppliedMethod
 import ObserverUnappliedMethod
 import OpaqueConsumingUsers
 import OpenClose
-import PartialApplyDynamicType
 import Phonebook
 import PointerArithmetics
 import PolymorphicCalls
@@ -131,6 +137,7 @@ import SequenceAlgos
 import SetTests
 import SevenBoom
 import Sim2DArray
+import SortIntPyramids
 import SortLargeExistentials
 import SortLettersInPlace
 import SortStrings
@@ -187,6 +194,7 @@ registerBenchmark(BinaryFloatingPointPropertiesBinade)
 registerBenchmark(BinaryFloatingPointPropertiesNextUp)
 registerBenchmark(BinaryFloatingPointPropertiesUlp)
 registerBenchmark(BitCount)
+registerBenchmark(Breadcrumbs)
 registerBenchmark(ByteSwap)
 registerBenchmark(COWTree)
 registerBenchmark(COWArrayGuaranteedParameterOverhead)
@@ -204,6 +212,7 @@ registerBenchmark(CharacterPropertiesStashed)
 registerBenchmark(CharacterPropertiesStashedMemo)
 registerBenchmark(CharacterPropertiesPrecomputed)
 registerBenchmark(Chars)
+registerBenchmark(Codable)
 registerBenchmark(Combos)
 registerBenchmark(ClassArrayGetter)
 registerBenchmark(DataBenchmarks)
@@ -215,14 +224,16 @@ registerBenchmark(Dictionary3)
 registerBenchmark(Dictionary4)
 registerBenchmark(Dictionary4Legacy)
 registerBenchmark(DictionaryBridge)
+registerBenchmark(DictionaryBridgeToObjC)
+registerBenchmark(DictionaryCompactMapValues)
 registerBenchmark(DictionaryCopy)
 registerBenchmark(DictionaryGroup)
 registerBenchmark(DictionaryKeysContains)
 registerBenchmark(DictionaryLiteral)
+registerBenchmark(DictionaryOfAnyHashableStrings)
 registerBenchmark(DictionaryRemove)
 registerBenchmark(DictionarySubscriptDefault)
 registerBenchmark(DictionarySwap)
-registerBenchmark(DoubleWidthDivision)
 registerBenchmark(DropFirst)
 registerBenchmark(DropLast)
 registerBenchmark(DropWhile)
@@ -230,11 +241,13 @@ registerBenchmark(ErrorHandling)
 registerBenchmark(Exclusivity)
 registerBenchmark(ExistentialPerformance)
 registerBenchmark(Fibonacci)
+registerBenchmark(FlattenListLoop)
+registerBenchmark(FlattenListFlatMap)
 registerBenchmark(FloatingPointPrinting)
 registerBenchmark(Hanoi)
 registerBenchmark(HashTest)
-registerBenchmark(HashQuadratic)
 registerBenchmark(Histogram)
+registerBenchmark(InsertCharacter)
 registerBenchmark(IntegrateTest)
 registerBenchmark(IterateData)
 registerBenchmark(Join)
@@ -252,10 +265,12 @@ registerBenchmark(NSStringConversion)
 registerBenchmark(NibbleSort)
 registerBenchmark(NopDeinit)
 registerBenchmark(ObjectAllocation)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
 registerBenchmark(ObjectiveCBridging)
 registerBenchmark(ObjectiveCBridgingStubs)
-#if !SWIFT_PACKAGE
+#if !(SWIFT_PACKAGE || Xcode)
 registerBenchmark(ObjectiveCNoBridgingStubs)
+#endif
 #endif
 registerBenchmark(ObserverClosure)
 registerBenchmark(ObserverForwarderStruct)
@@ -263,7 +278,6 @@ registerBenchmark(ObserverPartiallyAppliedMethod)
 registerBenchmark(ObserverUnappliedMethod)
 registerBenchmark(OpaqueConsumingUsers)
 registerBenchmark(OpenClose)
-registerBenchmark(PartialApplyDynamicType)
 registerBenchmark(Phonebook)
 registerBenchmark(PointerArithmetics)
 registerBenchmark(PolymorphicCalls)
@@ -294,6 +308,7 @@ registerBenchmark(SequenceAlgos)
 registerBenchmark(SetTests)
 registerBenchmark(SevenBoom)
 registerBenchmark(Sim2DArray)
+registerBenchmark(SortIntPyramids)
 registerBenchmark(SortLargeExistentials)
 registerBenchmark(SortLettersInPlace)
 registerBenchmark(SortStrings)
@@ -305,10 +320,12 @@ registerBenchmark(StringBuilder)
 registerBenchmark(StringComparison)
 registerBenchmark(StringEdits)
 registerBenchmark(StringEnum)
+registerBenchmark(StringHashing)
 registerBenchmark(StringInterpolation)
 registerBenchmark(StringInterpolationSmall)
 registerBenchmark(StringInterpolationManySmallSegments)
 registerBenchmark(StringMatch)
+registerBenchmark(StringNormalization)
 registerBenchmark(StringRemoveDupes)
 registerBenchmark(StringTests)
 registerBenchmark(StringWalk)

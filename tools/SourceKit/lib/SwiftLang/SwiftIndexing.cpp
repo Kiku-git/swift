@@ -104,6 +104,21 @@ private:
     return impl.finishSourceEntity(UID);
   }
 
+  std::vector<UIdent> getDeclAttributeUIDs(const Decl *decl) {
+    std::vector<UIdent> uidAttrs =
+      SwiftLangSupport::UIDsFromDeclAttributes(decl->getAttrs());
+
+    // check if we should report an implicit @objc attribute
+    if (!decl->getAttrs().getAttribute(DeclAttrKind::DAK_ObjC)) {
+      if (auto *VD = dyn_cast<ValueDecl>(decl)) {
+        if (VD->isObjC()) {
+            uidAttrs.push_back(SwiftLangSupport::getUIDForObjCAttr());
+        }
+      }
+    }
+    return uidAttrs;
+  }
+
   template <typename F>
   bool withEntityInfo(const IndexSymbol &symbol, F func) {
     EntityInfo info;
@@ -118,11 +133,11 @@ private:
     info.Column = symbol.column;
     info.ReceiverUSR = symbol.getReceiverUSR();
     info.IsDynamic = symbol.roles & (unsigned)SymbolRole::Dynamic;
+    info.IsImplicit = symbol.roles & (unsigned)SymbolRole::Implicit;
     info.IsTestCandidate = symbol.symInfo.Properties & SymbolProperty::UnitTest;
     std::vector<UIdent> uidAttrs;
     if (!isRef) {
-      uidAttrs =
-        SwiftLangSupport::UIDsFromDeclAttributes(symbol.decl->getAttrs());
+      uidAttrs = getDeclAttributeUIDs(symbol.decl);
       info.Attrs = uidAttrs;
     }
     return func(info);
@@ -141,8 +156,7 @@ private:
     info.IsTestCandidate = relation.symInfo.Properties & SymbolProperty::UnitTest;
     std::vector<UIdent> uidAttrs;
     if (!isRef) {
-      uidAttrs =
-      SwiftLangSupport::UIDsFromDeclAttributes(relation.decl->getAttrs());
+      uidAttrs = getDeclAttributeUIDs(relation.decl);
       info.Attrs = uidAttrs;
     }
     return func(info);
@@ -189,7 +203,7 @@ static void indexModule(llvm::MemoryBuffer *Input,
   }
 
   // Setup a typechecker for protocol conformance resolving.
-  OwnedResolver TypeResolver = createLazyResolver(Ctx);
+  (void)createTypeChecker(Ctx);
 
   SKIndexDataConsumer IdxDataConsumer(IdxConsumer);
   index::indexModule(Mod, Hash, IdxDataConsumer);
@@ -251,10 +265,10 @@ void SwiftLangSupport::indexSource(StringRef InputFile,
   CompilerInvocation Invocation;
   bool Failed = true;
   if (IsModuleIndexing) {
-    Failed = getASTManager().initCompilerInvocationNoInputs(
+    Failed = getASTManager()->initCompilerInvocationNoInputs(
         Invocation, Args, CI.getDiags(), Error);
   } else {
-    Failed = getASTManager().initCompilerInvocation(
+    Failed = getASTManager()->initCompilerInvocation(
         Invocation, Args, CI.getDiags(), InputFile, Error);
   }
   if (Failed) {
@@ -301,7 +315,7 @@ void SwiftLangSupport::indexSource(StringRef InputFile,
   }
 
   // Setup a typechecker for protocol conformance resolving.
-  OwnedResolver TypeResolver = createLazyResolver(CI.getASTContext());
+  (void)createTypeChecker(CI.getASTContext());
 
   SKIndexDataConsumer IdxDataConsumer(IdxConsumer);
   index::indexSourceFile(CI.getPrimarySourceFile(), Hash, IdxDataConsumer);

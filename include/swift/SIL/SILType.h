@@ -257,13 +257,34 @@ public:
   bool isLoadable(SILModule &M) const {
     return !isAddressOnly(M);
   }
+
+  /// Like isLoadable(SILModule), but specific to a function.
+  ///
+  /// This takes the resilience expansion of the function into account. If the
+  /// type is not loadable in general (because it's resilient), it still might
+  /// be loadable inside a resilient function in the module.
+  /// In other words: isLoadable(SILModule) is the conservative default, whereas
+  /// isLoadable(SILFunction) might give a more optimistic result.
+  bool isLoadable(SILFunction *inFunction) const {
+    return !isAddressOnly(inFunction);
+  }
+
   /// True if either:
   /// 1) The type, or the referenced type of an address type, is loadable.
   /// 2) The SIL Module conventions uses lowered addresses
   bool isLoadableOrOpaque(SILModule &M) const;
+
+  /// Like isLoadableOrOpaque(SILModule), but takes the resilience expansion of
+  /// \p inFunction into account (see isLoadable(SILFunction)).
+  bool isLoadableOrOpaque(SILFunction *inFunction) const;
+
   /// True if the type, or the referenced type of an address type, is
   /// address-only. This is the opposite of isLoadable.
   bool isAddressOnly(SILModule &M) const;
+
+  /// Like isAddressOnly(SILModule), but takes the resilience expansion of
+  /// \p inFunction into account (see isLoadable(SILFunction)).
+  bool isAddressOnly(SILFunction *inFunction) const;
 
   /// True if the type, or the referenced type of an address type, is trivial.
   bool isTrivial(SILModule &M) const;
@@ -365,7 +386,7 @@ public:
   }
   
   /// Returns the ASTContext for the referenced Swift type.
-  const ASTContext &getASTContext() const {
+  ASTContext &getASTContext() const {
     return getASTType()->getASTContext();
   }
 
@@ -456,12 +477,6 @@ public:
   /// representation. Class existentials do not always qualify.
   bool isHeapObjectReferenceType() const;
 
-  /// Return the SILType corresponding to the underlying type of the given
-  /// metatype type.
-  ///
-  /// *NOTE* Only call on SILTypes for metatype types.
-  SILType getMetatypeInstanceType(SILModule& M) const;
-
   /// Returns true if this SILType is an aggregate that contains \p Ty
   bool aggregateContainsRecord(SILType Ty, SILModule &SILMod) const;
   
@@ -480,10 +495,9 @@ public:
 
   /// Returns true if this is the AnyObject SILType;
   bool isAnyObject() const { return getASTType()->isAnyObject(); }
-
-  /// Returns the underlying referent SILType of an @sil_unowned or @sil_weak
-  /// Type.
-  SILType getReferentType(SILModule &M) const;
+  
+  /// Returns a SILType with any archetypes mapped out of context.
+  SILType mapTypeOutOfContext() const;
 
   /// Given two SIL types which are representations of the same type,
   /// check whether they have an abstraction difference.
@@ -513,6 +527,8 @@ public:
   static SILType getRawPointerType(const ASTContext &C);
   /// Get a builtin integer type as a SILType.
   static SILType getBuiltinIntegerType(unsigned bitWidth, const ASTContext &C);
+  /// Get the IntegerLiteral type as a SILType.
+  static SILType getBuiltinIntegerLiteralType(const ASTContext &C);
   /// Get a builtin floating-point type as a SILType.
   static SILType getBuiltinFloatType(BuiltinFloatType::FPKind Kind,
                                      const ASTContext &C);
@@ -563,7 +579,10 @@ NON_SIL_TYPE(LValue)
 
 CanSILFunctionType getNativeSILFunctionType(
     SILModule &M, Lowering::AbstractionPattern origType,
-    CanAnyFunctionType substType, Optional<SILDeclRef> constant = None,
+    CanAnyFunctionType substType,
+    Optional<SILDeclRef> origConstant = None,
+    Optional<SILDeclRef> constant = None,
+    Optional<SubstitutionMap> reqtSubs = None,
     Optional<ProtocolConformanceRef> witnessMethodConformance = None);
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILType T) {
