@@ -756,7 +756,7 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitness(ValueDecl *req,
   // Match the witness. If we don't succeed, throw away the inference
   // information.
   // FIXME: A renamed match might be useful to retain for the failure case.
-  if (matchWitness(tc, dc, req, witness, setup, matchTypes, finalize)
+  if (matchWitness(dc, req, witness, setup, matchTypes, finalize)
           .Kind != MatchKind::ExactMatch) {
     inferred.Inferred.clear();
   }
@@ -769,7 +769,7 @@ AssociatedTypeDecl *AssociatedTypeInference::findDefaultedAssociatedType(
                                              AssociatedTypeDecl *assocType) {
   // If this associated type has a default, we're done.
   tc.validateDecl(assocType);
-  if (!assocType->getDefaultDefinitionLoc().isNull())
+  if (assocType->hasDefaultDefinitionType())
     return assocType;
 
   // Look at overridden associated types.
@@ -974,7 +974,7 @@ Type AssociatedTypeInference::substCurrentTypeWitnesses(Type type) {
                           baseTy, assocType->getProtocol(), dc,
                           ConformanceCheckFlags::SkipConditionalRequirements);
       if (!localConformance || localConformance->isAbstract() ||
-          (localConformance->getConcrete()->getRootNormalConformance()
+          (localConformance->getConcrete()->getRootConformance()
              != conformance)) {
         return nullptr;
       }
@@ -1095,10 +1095,6 @@ AssociatedTypeInference::getSubstOptionsWithCurrentTypeWitnesses() {
 bool AssociatedTypeInference::checkCurrentTypeWitnesses(
        const SmallVectorImpl<std::pair<ValueDecl *, ValueDecl *>>
          &valueWitnesses) {
-  // If we don't have a requirement signature for this protocol, bail out.
-  // FIXME: We should never get to this point. Or we should always fail.
-  if (!proto->isRequirementSignatureComputed()) return false;
-
   // Check any same-type requirements in the protocol's requirement signature.
   SubstOptions options = getSubstOptionsWithCurrentTypeWitnesses();
 
@@ -1870,7 +1866,7 @@ bool AssociatedTypeInference::diagnoseAmbiguousSolutions(
           // Otherwise, we have a default.
           diags.diagnose(assocType, diag::associated_type_deduction_default,
                          type)
-            .highlight(assocType->getDefaultDefinitionLoc().getSourceRange());
+            .highlight(assocType->getDefaultDefinitionTypeRepr()->getSourceRange());
         };
 
         diagnoseWitness(firstMatch, firstType);

@@ -94,18 +94,28 @@ ProtocolConformanceRef::subst(Type origType,
 ProtocolConformanceRef
 ProtocolConformanceRef::subst(Type origType,
                               TypeSubstitutionFn subs,
-                              LookupConformanceFn conformances) const {
+                              LookupConformanceFn conformances,
+                              SubstOptions options) const {
   if (isInvalid())
     return *this;
 
   // If we have a concrete conformance, we need to substitute the
   // conformance to apply to the new type.
   if (isConcrete())
-    return ProtocolConformanceRef(getConcrete()->subst(subs, conformances));
+    return ProtocolConformanceRef(getConcrete()->subst(subs, conformances,
+                                                       options));
+  // If the type is an opaque archetype, the conformance will remain abstract,
+  // unless we're specifically substituting opaque types.
+  if (auto origArchetype = origType->getAs<ArchetypeType>()) {
+    if (!options.contains(SubstFlags::SubstituteOpaqueArchetypes)
+        && isa<OpaqueTypeArchetypeType>(origArchetype->getRoot())) {
+      return *this;
+    }
+  }
 
   // Otherwise, compute the substituted type.
   auto substType = origType.subst(subs, conformances,
-                                  SubstFlags::UseErrorType);
+                                  options | SubstFlags::UseErrorType);
 
   // Opened existentials trivially conform and do not need to go through
   // substitution map lookup.
@@ -132,15 +142,14 @@ ProtocolConformanceRef::subst(Type origType,
 }
 
 Type
-ProtocolConformanceRef::getTypeWitnessByName(Type type,
-                                             ProtocolConformanceRef conformance,
-                                             Identifier name,
-                                             LazyResolver *resolver) {
-  assert(!conformance.isInvalid());
+ProtocolConformanceRef::getTypeWitnessByName(Type type, Identifier name) const {
+  assert(!isInvalid());
 
   // Find the named requirement.
+  ProtocolDecl *proto = getRequirement();
   AssociatedTypeDecl *assocType = nullptr;
-  auto members = conformance.getRequirement()->lookupDirect(name);
+  auto members = proto->lookupDirect(name,
+                      NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions);
   for (auto member : members) {
     assocType = dyn_cast<AssociatedTypeDecl>(member);
     if (assocType)
@@ -151,21 +160,36 @@ ProtocolConformanceRef::getTypeWitnessByName(Type type,
   if (!assocType)
     return nullptr;
 
-  if (conformance.isAbstract()) {
-    // For an archetype, retrieve the nested type with the appropriate
-    // name. There are no conformance tables.
-    if (auto archetype = type->getAs<ArchetypeType>()) {
-      return archetype->getNestedType(name);
-    }
+  return assocType->getDeclaredInterfaceType().subst(
+    SubstitutionMap::getProtocolSubstitutions(proto, type, *this));
+}
 
-    return DependentMemberType::get(type, assocType);
+ConcreteDeclRef
+ProtocolConformanceRef::getWitnessByName(Type type, DeclName name) const {
+  // Find the named requirement.
+  auto *proto = getRequirement();
+  auto results =
+    proto->lookupDirect(name,
+                      NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions);
+
+  ValueDecl *requirement = nullptr;
+  for (auto *result : results) {
+    if (isa<ProtocolDecl>(result->getDeclContext()))
+      requirement = result;
   }
 
-  auto concrete = conformance.getConcrete();
-  if (!concrete->hasTypeWitness(assocType, resolver)) {
-    return nullptr;
+  if (requirement == nullptr)
+    return ConcreteDeclRef();
+
+  // For a type with dependent conformance, just return the requirement from
+  // the protocol. There are no protocol conformance tables.
+  if (!isConcrete()) {
+    auto subs = SubstitutionMap::getProtocolSubstitutions(proto, type, *this);
+    return ConcreteDeclRef(requirement, subs);
   }
-  return concrete->getTypeWitness(assocType, resolver);
+
+  auto *resolver = proto->getASTContext().getLazyResolver();
+  return getConcrete()->getWitnessDeclRef(requirement, resolver);
 }
 
 void *ProtocolConformance::operator new(size_t bytes, ASTContext &context,
@@ -431,7 +455,7 @@ bool NormalProtocolConformance::isRetroactive() const {
     // defined in a Clang module.
     if (auto nominalLoadedModule =
           dyn_cast<LoadedFile>(nominal->getModuleScopeContext())) {
-      if (auto overlayModule = nominalLoadedModule->getAdapterModule())
+      if (auto overlayModule = nominalLoadedModule->getOverlayModule())
         nominalModule = overlayModule;
     }
 
@@ -458,12 +482,7 @@ bool NormalProtocolConformance::isResilient() const {
   if (!getType()->getAnyNominal()->isResilient())
     return false;
 
-  switch (getDeclContext()->getParentModule()->getResilienceStrategy()) {
-  case ResilienceStrategy::Resilient:
-    return true;
-  case ResilienceStrategy::Default:
-    return false;
-  }
+  return getDeclContext()->getParentModule()->isResilient();
 }
 
 Optional<ArrayRef<Requirement>>
@@ -493,37 +512,6 @@ ProtocolConformanceRef::getConditionalRequirements() const {
   else
     // An abstract conformance is never conditional, as above.
     return {};
-}
-
-ProtocolConformanceRef
-ProtocolConformanceRef::getInheritedConformanceRef(ProtocolDecl *base) const {
-  if (isAbstract()) {
-    assert(getRequirement()->inheritsFrom(base));
-    return ProtocolConformanceRef(base);
-  }
-
-  auto concrete = getConcrete();
-  auto proto = concrete->getProtocol();
-  auto path =
-    proto->getGenericSignature()->getConformanceAccessPath(
-                                            proto->getSelfInterfaceType(), base);
-  ProtocolConformanceRef result = *this;
-  Type resultType = concrete->getType();
-  bool first = true;
-  for (const auto &step : path) {
-    if (first) {
-      assert(step.first->isEqual(proto->getSelfInterfaceType()));
-      assert(step.second == proto);
-      first = false;
-      continue;
-    }
-
-    result =
-        result.getAssociatedConformance(resultType, step.first, step.second);
-    resultType = result.getAssociatedType(resultType, step.first);
-  }
-
-  return result;
 }
 
 void NormalProtocolConformance::differenceAndStoreConditionalRequirements()
@@ -1060,12 +1048,12 @@ SpecializedProtocolConformance::getTypeWitnessAndDecl(
 
   // Local function to determine whether we will end up referring to a
   // tentative witness that may not be chosen.
-  auto normal = GenericConformance->getRootNormalConformance();
+  auto root = GenericConformance->getRootConformance();
   auto isTentativeWitness = [&] {
-    if (normal->getState() != ProtocolConformanceState::CheckingTypeWitnesses)
+    if (root->getState() != ProtocolConformanceState::CheckingTypeWitnesses)
       return false;
 
-    return !normal->hasTypeWitness(assocType, nullptr);
+    return !root->hasTypeWitness(assocType, nullptr);
   };
 
   auto genericWitnessAndDecl
@@ -1207,7 +1195,8 @@ ProtocolConformance::subst(SubstitutionMap subMap) const {
 
 ProtocolConformance *
 ProtocolConformance::subst(TypeSubstitutionFn subs,
-                           LookupConformanceFn conformances) const {
+                           LookupConformanceFn conformances,
+                           SubstOptions options) const {
   switch (getKind()) {
   case ProtocolConformanceKind::Normal: {
     auto origType = getType();
@@ -1217,7 +1206,7 @@ ProtocolConformance::subst(TypeSubstitutionFn subs,
 
     auto subMap = SubstitutionMap::get(getGenericSignature(),
                                        subs, conformances);
-    auto substType = origType.subst(subMap, SubstFlags::UseErrorType);
+    auto substType = origType.subst(subMap, options | SubstFlags::UseErrorType);
     if (substType->isEqual(origType))
       return const_cast<ProtocolConformance *>(this);
 
@@ -1243,11 +1232,12 @@ ProtocolConformance::subst(TypeSubstitutionFn subs,
     if (origBaseType->hasTypeParameter() ||
         origBaseType->hasArchetype()) {
       // Substitute into the superclass.
-      inheritedConformance = inheritedConformance->subst(subs, conformances);
+      inheritedConformance = inheritedConformance->subst(subs, conformances,
+                                                         options);
     }
 
     auto substType = origType.subst(subs, conformances,
-                                    SubstFlags::UseErrorType);
+                                    options | SubstFlags::UseErrorType);
     return substType->getASTContext()
       .getInheritedConformance(substType, inheritedConformance);
   }
@@ -1259,10 +1249,10 @@ ProtocolConformance::subst(TypeSubstitutionFn subs,
 
     auto origType = getType();
     auto substType = origType.subst(subs, conformances,
-                                    SubstFlags::UseErrorType);
+                                    options | SubstFlags::UseErrorType);
     return substType->getASTContext()
       .getSpecializedConformance(substType, genericConformance,
-                                 subMap.subst(subs, conformances));
+                                 subMap.subst(subs, conformances, options));
   }
   }
   llvm_unreachable("bad ProtocolConformanceKind");

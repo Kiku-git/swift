@@ -57,8 +57,8 @@ ManagedValue ManagedValue::formalAccessCopy(SILGenFunction &SGF,
 
 /// Store a copy of this value with independent ownership into the given
 /// uninitialized address.
-void ManagedValue::copyInto(SILGenFunction &SGF, SILValue dest,
-                            SILLocation loc) {
+void ManagedValue::copyInto(SILGenFunction &SGF, SILLocation loc,
+                            SILValue dest) {
   auto &lowering = SGF.getTypeLowering(getType());
   if (lowering.isAddressOnly() && SGF.silConv.useLoweredAddresses()) {
     SGF.B.createCopyAddr(loc, getValue(), dest, IsNotTake, IsInitialization);
@@ -217,7 +217,7 @@ bool ManagedValue::isPlusOne(SILGenFunction &SGF) const {
 
   // Ignore trivial values since for our purposes they are always at +1 since
   // they can always be passed to +1 APIs.
-  if (getType().isTrivial(SGF.F.getModule()))
+  if (getType().isTrivial(SGF.F))
     return true;
 
   // If we have an object and the object has any ownership, the same

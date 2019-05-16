@@ -22,6 +22,8 @@
 #include "swift/AST/Types.h"
 #include "swift/Basic/Range.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/SIL/ApplySite.h"
+#include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/DynamicCasts.h"
@@ -35,7 +37,6 @@
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILVTableVisitor.h"
 #include "swift/SIL/SILVisitor.h"
-#include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/TypeLowering.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -79,6 +80,10 @@ static llvm::cl::opt<bool> SkipConvertEscapeToNoescapeAttributes(
 static bool isArchetypeValidInFunction(ArchetypeType *A, const SILFunction *F) {
   auto root = dyn_cast<PrimaryArchetypeType>(A->getRoot());
   if (!root)
+    return true;
+  if (isa<OpenedArchetypeType>(A->getRoot()))
+    return true;
+  if (isa<OpaqueTypeArchetypeType>(A->getRoot()))
     return true;
 
   // Ok, we have a primary archetype, make sure it is in the nested generic
@@ -128,13 +133,14 @@ void verifyKeyPathComponent(SILModule &M,
                             bool forPropertyDescriptor,
                             bool hasIndices) {
   auto &C = M.getASTContext();
-  
+
+  auto opaque = AbstractionPattern::getOpaque();
   auto loweredBaseTy =
-    M.Types.getLoweredType(AbstractionPattern::getOpaque(), baseTy);
+    M.Types.getLoweredType(opaque, baseTy, expansion);
   auto componentTy = component.getComponentType().subst(patternSubs)
     ->getCanonicalType();
   auto loweredComponentTy =
-    M.Types.getLoweredType(AbstractionPattern::getOpaque(), componentTy);
+    M.Types.getLoweredType(opaque, componentTy, expansion);
 
   auto checkIndexEqualsAndHash = [&]{
     if (!component.getSubscriptIndices().empty()) {
@@ -386,15 +392,14 @@ void verifyKeyPathComponent(SILModule &M,
     require(loweredBaseTy.is<TupleType>(),
             "invalid baseTy, should have been a TupleType");
       
-    auto tupleTy = loweredBaseTy.getAs<TupleType>();
+    auto tupleTy = loweredBaseTy.castTo<TupleType>();
     auto eltIdx = component.getTupleIndex();
       
     require(eltIdx < tupleTy->getNumElements(),
             "invalid element index, greater than # of tuple elements");
 
-    auto eltTy = tupleTy->getElementType(eltIdx)
-      ->getReferenceStorageReferent()
-      ->getCanonicalType();
+    auto eltTy = tupleTy.getElementType(eltIdx)
+      .getReferenceStorageReferent();
     
     require(eltTy == componentTy,
             "tuple element type should match the type of the component");
@@ -405,6 +410,192 @@ void verifyKeyPathComponent(SILModule &M,
   
   baseTy = componentTy;
 }
+
+/// Check if according to the SIL language model this memory /must only/ be used
+/// immutably. Today this is only applied to in_guaranteed arguments and
+/// open_existential_addr. We should expand it as needed.
+struct ImmutableAddressUseVerifier {
+  SmallVector<Operand *, 32> worklist;
+
+  bool isConsumingOrMutatingArgumentConvention(SILArgumentConvention conv) {
+    switch (conv) {
+    case SILArgumentConvention::Indirect_In_Guaranteed:
+      return false;
+
+    case SILArgumentConvention::Indirect_InoutAliasable:
+      // DISCUSSION: We do not consider inout_aliasable to be "truly mutating"
+      // since today it is just used as a way to mark a captured argument and
+      // not that something truly has mutating semantics. The reason why this
+      // is safe is that the typechecker guarantees that if our value was
+      // immutable, then the use in the closure must be immutable as well.
+      //
+      // TODO: Remove this in favor of using Inout and In_Guaranteed.
+      return false;
+
+    case SILArgumentConvention::Indirect_Out:
+    case SILArgumentConvention::Indirect_In:
+    case SILArgumentConvention::Indirect_In_Constant:
+    case SILArgumentConvention::Indirect_Inout:
+      return true;
+
+    case SILArgumentConvention::Direct_Unowned:
+    case SILArgumentConvention::Direct_Guaranteed:
+    case SILArgumentConvention::Direct_Owned:
+    case SILArgumentConvention::Direct_Deallocating:
+      assert(conv.isIndirectConvention() && "Expect an indirect convention");
+      return true; // return something "conservative".
+    }
+    llvm_unreachable("covered switch isn't covered?!");
+  }
+
+  bool isConsumingOrMutatingApplyUse(Operand *use) {
+    ApplySite apply(use->getUser());
+    assert(apply && "Not an apply instruction kind");
+    auto conv = apply.getArgumentConvention(*use);
+    return isConsumingOrMutatingArgumentConvention(conv);
+  }
+
+  bool isConsumingOrMutatingYieldUse(Operand *use) {
+    // For now, just say that it is non-consuming for now.
+    auto *yield = cast<YieldInst>(use->getUser());
+    auto conv = yield->getArgumentConventionForOperand(*use);
+    return isConsumingOrMutatingArgumentConvention(conv);
+  }
+
+  // A "copy_addr %src [take] to *" is consuming on "%src".
+  // A "copy_addr * to * %dst" is mutating on "%dst".
+  bool isConsumingOrMutatingCopyAddrUse(Operand *use) {
+    auto *copyAddr = cast<CopyAddrInst>(use->getUser());
+    if (copyAddr->getDest() == use->get())
+      return true;
+    if (copyAddr->getSrc() == use->get() && copyAddr->isTakeOfSrc() == IsTake)
+      return true;
+    return false;
+  }
+
+  bool isCastToNonConsuming(UncheckedAddrCastInst *i) {
+    // Check if any of our uses are consuming. If none of them are consuming, we
+    // are good to go.
+    return llvm::none_of(i->getUses(), [&](Operand *use) -> bool {
+      auto *inst = use->getUser();
+      switch (inst->getKind()) {
+      default:
+        return false;
+      case SILInstructionKind::ApplyInst:
+      case SILInstructionKind::TryApplyInst:
+      case SILInstructionKind::PartialApplyInst:
+      case SILInstructionKind::BeginApplyInst:
+        return isConsumingOrMutatingApplyUse(use);
+      }
+    });
+  }
+
+  bool isMutatingOrConsuming(SILValue address) {
+    copy(address->getUses(), std::back_inserter(worklist));
+    while (!worklist.empty()) {
+      auto *use = worklist.pop_back_val();
+      auto *inst = use->getUser();
+
+      if (inst->isTypeDependentOperand(*use))
+        continue;
+
+      switch (inst->getKind()) {
+      case SILInstructionKind::MarkDependenceInst:
+      case SILInstructionKind::LoadBorrowInst:
+      case SILInstructionKind::DebugValueAddrInst:
+      case SILInstructionKind::ExistentialMetatypeInst:
+      case SILInstructionKind::ValueMetatypeInst:
+      case SILInstructionKind::FixLifetimeInst:
+      case SILInstructionKind::KeyPathInst:
+      case SILInstructionKind::SwitchEnumAddrInst:
+        break;
+      case SILInstructionKind::AddressToPointerInst:
+        // We assume that the user is attempting to do something unsafe since we
+        // are converting to a raw pointer. So just ignore this use.
+        //
+        // TODO: Can we do better?
+        break;
+      case SILInstructionKind::BranchInst:
+      case SILInstructionKind::CondBranchInst:
+        // We do not analyze through branches and cond_br instructions and just
+        // assume correctness. This is so that we can avoid having to analyze
+        // through phi loops and since we want to remove address phis (meaning
+        // that this eventually would never be able to happen). Once that
+        // changes happens, we should remove this code and just error below.
+        break;
+      case SILInstructionKind::ApplyInst:
+      case SILInstructionKind::TryApplyInst:
+      case SILInstructionKind::PartialApplyInst:
+      case SILInstructionKind::BeginApplyInst:
+        if (isConsumingOrMutatingApplyUse(use))
+          return true;
+        break;
+      case SILInstructionKind::YieldInst:
+        if (isConsumingOrMutatingYieldUse(use))
+          return true;
+        break;
+      case SILInstructionKind::CopyAddrInst:
+        if (isConsumingOrMutatingCopyAddrUse(use))
+          return true;
+        else
+          break;
+      case SILInstructionKind::DestroyAddrInst:
+        return true;
+      case SILInstructionKind::UncheckedAddrCastInst: {
+        if (isCastToNonConsuming(cast<UncheckedAddrCastInst>(inst))) {
+          break;
+        }
+        return true;
+      }
+      case SILInstructionKind::CheckedCastAddrBranchInst:
+        switch (cast<CheckedCastAddrBranchInst>(inst)->getConsumptionKind()) {
+        case CastConsumptionKind::BorrowAlways:
+          llvm_unreachable("checked_cast_addr_br cannot have BorrowAlways");
+        case CastConsumptionKind::CopyOnSuccess:
+          break;
+        case CastConsumptionKind::TakeAlways:
+        case CastConsumptionKind::TakeOnSuccess:
+          return true;
+        }
+        break;
+      case SILInstructionKind::LoadInst:
+        // A 'non-taking' value load is harmless.
+        if (cast<LoadInst>(inst)->getOwnershipQualifier() ==
+            LoadOwnershipQualifier::Take)
+          return true;
+        break;
+#define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)             \
+  case SILInstructionKind::Load##Name##Inst:                                   \
+    if (cast<Load##Name##Inst>(inst)->isTake())                                \
+      return true;                                                             \
+    break;
+#include "swift/AST/ReferenceStorage.def"
+      case SILInstructionKind::OpenExistentialAddrInst:
+        // If we have a mutable use, return true. Otherwise fallthrough since we
+        // want to look through immutable uses.
+        if (cast<OpenExistentialAddrInst>(inst)->getAccessKind() !=
+            OpenedExistentialAccess::Immutable)
+          return true;
+        LLVM_FALLTHROUGH;
+      case SILInstructionKind::StructElementAddrInst:
+      case SILInstructionKind::TupleElementAddrInst:
+      case SILInstructionKind::IndexAddrInst:
+      case SILInstructionKind::TailAddrInst:
+      case SILInstructionKind::IndexRawPointerInst:
+        // Add these to our worklist.
+        for (auto result : inst->getResults()) {
+          copy(result->getUses(), std::back_inserter(worklist));
+        }
+        break;
+      default:
+        llvm::errs() << "Unhandled, unexpected instruction: " << *inst;
+        llvm_unreachable("invoking standard assertion failure");
+        break;
+      }
+    }
+    return false;
+  }
+};
 
 /// The SIL verifier walks over a SIL function / basic block / instruction,
 /// checking and enforcing its invariants.
@@ -429,7 +620,7 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
   void operator=(const SILVerifier&) = delete;
 public:
   bool isSILOwnershipEnabled() const {
-    return F.getModule().getOptions().EnableSILOwnership;
+    return F.getModule().getOptions().VerifySILOwnership;
   }
 
   void _require(bool condition, const Twine &complaint,
@@ -551,7 +742,8 @@ public:
   /// Require two function types to be ABI-compatible.
   void requireABICompatibleFunctionTypes(CanSILFunctionType type1,
                                          CanSILFunctionType type2,
-                                         const Twine &what) {
+                                         const Twine &what,
+                                         SILFunction *inFunction = nullptr) {
     auto complain = [=](const char *msg) -> std::function<void()> {
       return [=]{
         llvm::dbgs() << "  " << msg << '\n'
@@ -567,7 +759,7 @@ public:
     };
 
     // If we didn't have a failure, return.
-    auto Result = type1->isABICompatibleWith(type2);
+    auto Result = type1->isABICompatibleWith(type2, inFunction);
     if (Result.isCompatible())
       return;
 
@@ -711,7 +903,19 @@ public:
                     || arg->getParent()->getSinglePredecessorBlock(),
                 "Non-branch terminator must have a unique successor.");
       }
+      return;
     }
+
+    // If we are not in lowered SIL and have an in_guaranteed function argument,
+    // verify that we do not mutate or consume it.
+    auto *fArg = cast<SILFunctionArgument>(arg);
+    if (fArg->getModule().getStage() == SILStage::Lowered ||
+        !fArg->getType().isAddress() ||
+        !fArg->hasConvention(SILArgumentConvention::Indirect_In_Guaranteed))
+      return;
+
+    require(!ImmutableAddressUseVerifier().isMutatingOrConsuming(fArg),
+            "Found mutating or consuming use of an in_guaranteed parameter?!");
   }
 
   void visitSILInstruction(SILInstruction *I) {
@@ -743,7 +947,7 @@ public:
     // ownership.
     if (!F->hasOwnership())
       return;
-    SILValue(V).verifyOwnership(F->getModule(), &DEBlocks);
+    SILValue(V).verifyOwnership(&DEBlocks);
   }
 
   void checkSILInstruction(SILInstruction *I) {
@@ -1551,7 +1755,7 @@ public:
   void checkLoadInst(LoadInst *LI) {
     require(LI->getType().isObject(), "Result of load must be an object");
     require(!fnConv.useLoweredAddresses()
-                || LI->getType().isLoadable(LI->getFunction()),
+                || LI->getType().isLoadable(*LI->getFunction()),
             "Load must have a loadable type");
     require(LI->getOperand()->getType().isAddress(),
             "Load operand must be an address");
@@ -1571,14 +1775,14 @@ public:
       require(F.hasOwnership(),
               "Load with qualified ownership in an unqualified function");
       // TODO: Could probably make this a bit stricter.
-      require(!LI->getType().isTrivial(LI->getModule()),
+      require(!LI->getType().isTrivial(*LI->getFunction()),
               "load [copy] or load [take] can only be applied to non-trivial "
               "types");
       break;
     case LoadOwnershipQualifier::Trivial:
       require(F.hasOwnership(),
               "Load with qualified ownership in an unqualified function");
-      require(LI->getType().isTrivial(LI->getModule()),
+      require(LI->getType().isTrivial(*LI->getFunction()),
               "A load with trivial ownership must load a trivial type");
       break;
     }
@@ -1590,7 +1794,7 @@ public:
         "Inst with qualified ownership in a function that is not qualified");
     require(LBI->getType().isObject(), "Result of load must be an object");
     require(!fnConv.useLoweredAddresses()
-            || LBI->getType().isLoadable(LBI->getFunction()),
+            || LBI->getType().isLoadable(*LBI->getFunction()),
             "Load must have a loadable type");
     require(LBI->getOperand()->getType().isAddress(),
             "Load operand must be an address");
@@ -1708,7 +1912,7 @@ public:
     require(SI->getSrc()->getType().isObject(),
             "Can't store from an address source");
     require(!fnConv.useLoweredAddresses()
-                || SI->getSrc()->getType().isLoadable(SI->getFunction()),
+                || SI->getSrc()->getType().isLoadable(*SI->getFunction()),
             "Can't store a non loadable type");
     require(SI->getDest()->getType().isAddress(),
             "Must store to an address dest");
@@ -1729,7 +1933,7 @@ public:
           F.hasOwnership(),
           "Inst with qualified ownership in a function that is not qualified");
       // TODO: Could probably make this a bit stricter.
-      require(!SI->getSrc()->getType().isTrivial(SI->getModule()),
+      require(!SI->getSrc()->getType().isTrivial(*SI->getFunction()),
               "store [init] or store [assign] can only be applied to "
               "non-trivial types");
       break;
@@ -1738,7 +1942,7 @@ public:
           F.hasOwnership(),
           "Inst with qualified ownership in a function that is not qualified");
       SILValue Src = SI->getSrc();
-      require(Src->getType().isTrivial(SI->getModule()) ||
+      require(Src->getType().isTrivial(*SI->getFunction()) ||
               Src.getOwnershipKind() == ValueOwnershipKind::Any,
               "A store with trivial ownership must store a type with trivial "
               "ownership");
@@ -1755,6 +1959,53 @@ public:
     require(Dest->getType().isAddress(), "Must store to an address dest");
     require(Dest->getType().getObjectType() == Src->getType(),
             "Store operand type and dest type mismatch");
+  }
+
+  void checkAssignByDelegateInst(AssignByDelegateInst *AI) {
+    SILValue Src = AI->getSrc(), Dest = AI->getDest();
+    require(AI->getModule().getStage() == SILStage::Raw,
+            "assign instruction can only exist in raw SIL");
+    require(Dest->getType().isAddress(), "Must store to an address dest");
+
+    unsigned indirectInitResults = Src->getType().isAddress() ? 1 : 0;
+
+    SILValue initFn = AI->getInitializer();
+    CanSILFunctionType initTy = initFn->getType().castTo<SILFunctionType>();
+    SILFunctionConventions initConv(initTy, AI->getModule());
+    require(initConv.getNumIndirectSILResults() == indirectInitResults,
+            "init function has wrong number of indirect results");
+    unsigned firstArgIdx = initConv.getSILArgIndexOfFirstParam();
+    require(initConv.getNumSILArguments() == firstArgIdx + 1,
+            "init function has wrong number of arguments");
+    require(Src->getType() == initConv.getSILArgumentType(firstArgIdx),
+            "wrong argument type of init function");
+    switch (initConv.getNumIndirectSILResults()) {
+      case 0:
+        require(initConv.getNumDirectSILResults() == 1,
+                "wrong number of init function results");
+        require(Dest->getType().getObjectType() ==
+                initConv.getDirectSILResultTypes().front(),
+                "wrong init function result type");
+        break;
+      case 1:
+        require(initConv.getNumDirectSILResults() == 0,
+                "wrong number of init function results");
+        require(Dest->getType() == initConv.getIndirectSILResultTypes().front(),
+                "wrong indirect init function result type");
+        break;
+      default:
+        require(false, "wrong number of indirect init function results");
+    }
+
+    SILValue setterFn = AI->getSetter();
+    CanSILFunctionType setterTy = setterFn->getType().castTo<SILFunctionType>();
+    SILFunctionConventions setterConv(setterTy, AI->getModule());
+    require(setterConv.getNumIndirectSILResults() == 0,
+            "set function has indirect results");
+    require(setterConv.getNumSILArguments() == 1,
+            "init function has wrong number of arguments");
+    require(Src->getType() == setterConv.getSILArgumentType(0),
+            "wrong argument type of init function");
   }
 
 #define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...) \
@@ -1913,7 +2164,7 @@ public:
             "Dest address should be lvalue");
     require(SI->getDest()->getType() == SI->getSrc()->getType(),
             "Store operand type and dest type mismatch");
-    require(F.getModule().isTypeABIAccessible(SI->getDest()->getType()),
+    require(F.isTypeABIAccessible(SI->getDest()->getType()),
             "cannot directly copy type with inaccessible ABI");
   }
 
@@ -1934,7 +2185,7 @@ public:
   void checkCopyValueInst(CopyValueInst *I) {
     require(I->getOperand()->getType().isObject(),
             "Source value should be an object value");
-    require(!I->getOperand()->getType().isTrivial(I->getModule()),
+    require(!I->getOperand()->getType().isTrivial(*I->getFunction()),
             "Source value should be non-trivial");
     require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
             "copy_value is only valid in functions with qualified "
@@ -1944,7 +2195,7 @@ public:
   void checkDestroyValueInst(DestroyValueInst *I) {
     require(I->getOperand()->getType().isObject(),
             "Source value should be an object value");
-    require(!I->getOperand()->getType().isTrivial(I->getModule()),
+    require(!I->getOperand()->getType().isTrivial(*I->getFunction()),
             "Source value should be non-trivial");
     require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
             "destroy_value is only valid in functions with qualified "
@@ -2291,10 +2542,8 @@ public:
         ->getInstanceType()->getClassOrBoundGenericClass();
     require(class2,
             "Second operand of dealloc_partial_ref must be a class metatype");
-    while (class1 != class2) {
-      class1 = class1->getSuperclassDecl();
-      require(class1, "First operand not superclass of second instance type");
-    }
+    require(class2->isSuperclassOf(class1),
+            "First operand not superclass of second instance type");
   }
 
   void checkAllocBoxInst(AllocBoxInst *AI) {
@@ -2328,7 +2577,7 @@ public:
   void checkDestroyAddrInst(DestroyAddrInst *DI) {
     require(DI->getOperand()->getType().isAddress(),
             "Operand of destroy_addr must be address");
-    require(F.getModule().isTypeABIAccessible(DI->getOperand()->getType()),
+    require(F.isTypeABIAccessible(DI->getOperand()->getType()),
             "cannot directly destroy type with inaccessible ABI");
   }
 
@@ -2828,114 +3077,8 @@ public:
     if (allowedAccessKind == OpenedExistentialAccess::Mutable)
       return;
 
-    auto isConsumingOrMutatingApplyUse = [](Operand *use) -> bool {
-      ApplySite apply(use->getUser());
-      assert(apply && "Not an apply instruction kind");
-      auto conv = apply.getArgumentConvention(*use);
-      switch (conv) {
-      case SILArgumentConvention::Indirect_In_Guaranteed:
-        return false;
-
-      case SILArgumentConvention::Indirect_Out:
-      case SILArgumentConvention::Indirect_In:
-      case SILArgumentConvention::Indirect_In_Constant:
-      case SILArgumentConvention::Indirect_Inout:
-      case SILArgumentConvention::Indirect_InoutAliasable:
-        return true;
-
-      case SILArgumentConvention::Direct_Unowned:
-      case SILArgumentConvention::Direct_Guaranteed:
-      case SILArgumentConvention::Direct_Owned:
-      case SILArgumentConvention::Direct_Deallocating:
-        assert(conv.isIndirectConvention() && "Expect an indirect convention");
-        return true; // return something "conservative".
-      }
-      llvm_unreachable("covered switch isn't covered?!");
-    };
-
-    // A "copy_addr %src [take] to *" is consuming on "%src".
-    // A "copy_addr * to * %dst" is mutating on "%dst".
-    auto isConsumingOrMutatingCopyAddrUse = [](Operand *use) -> bool {
-      auto *copyAddr = cast<CopyAddrInst>(use->getUser());
-      if (copyAddr->getDest() == use->get())
-        return true;
-      if (copyAddr->getSrc() == use->get() && copyAddr->isTakeOfSrc() == IsTake)
-        return true;
-      return false;
-    };
-
-    auto isMutatingOrConsuming = [=](OpenExistentialAddrInst *OEI) -> bool {
-      for (auto *use : OEI->getUses()) {
-        auto *inst = use->getUser();
-        if (inst->isTypeDependentOperand(*use))
-          continue;
-        switch (inst->getKind()) {
-        case SILInstructionKind::MarkDependenceInst:
-          break;
-        case SILInstructionKind::ApplyInst:
-        case SILInstructionKind::TryApplyInst:
-        case SILInstructionKind::PartialApplyInst:
-          if (isConsumingOrMutatingApplyUse(use))
-            return true;
-          else
-            break;
-        case SILInstructionKind::CopyAddrInst:
-          if (isConsumingOrMutatingCopyAddrUse(use))
-            return true;
-          else
-            break;
-        case SILInstructionKind::DestroyAddrInst:
-          return true;
-        case SILInstructionKind::UncheckedAddrCastInst: {
-          auto isCastToNonConsuming = [=](UncheckedAddrCastInst *I) -> bool {
-            for (auto *use : I->getUses()) {
-              auto *inst = use->getUser();
-              switch (inst->getKind()) {
-              case SILInstructionKind::ApplyInst:
-              case SILInstructionKind::TryApplyInst:
-              case SILInstructionKind::PartialApplyInst:
-                if (isConsumingOrMutatingApplyUse(use))
-                  return false;
-                continue;
-              default:
-                continue;
-              }
-            }
-            return true;
-          };
-          if (isCastToNonConsuming(cast<UncheckedAddrCastInst>(inst))) {
-            break;
-          }
-          return true;
-        }
-        case SILInstructionKind::CheckedCastAddrBranchInst:
-          switch (cast<CheckedCastAddrBranchInst>(inst)->getConsumptionKind()) {
-          case CastConsumptionKind::BorrowAlways:
-            llvm_unreachable("checked_cast_addr_br cannot have BorrowAlways");
-          case CastConsumptionKind::CopyOnSuccess:
-            break;
-          case CastConsumptionKind::TakeAlways:
-          case CastConsumptionKind::TakeOnSuccess:
-            return true;
-          }
-          break;
-        case SILInstructionKind::LoadInst:
-          // A 'non-taking' value load is harmless.
-          return cast<LoadInst>(inst)->getOwnershipQualifier() ==
-                 LoadOwnershipQualifier::Take;
-          break;
-        case SILInstructionKind::DebugValueAddrInst:
-          // Harmless use.
-          break;
-        default:
-          llvm_unreachable("Unhandled unexpected instruction");
-          break;
-        }
-      }
-      return false;
-    };
-    require(allowedAccessKind == OpenedExistentialAccess::Mutable
-            || !isMutatingOrConsuming(OEI),
+    require(allowedAccessKind == OpenedExistentialAccess::Mutable ||
+                !ImmutableAddressUseVerifier().isMutatingOrConsuming(OEI),
             "open_existential_addr uses that consumes or mutates but is not "
             "opened for mutation");
   }
@@ -3585,7 +3728,7 @@ public:
             "unchecked_trivial_bit_cast must operate on a value");
     require(BI->getType().isObject(),
             "unchecked_trivial_bit_cast must produce a value");
-    require(BI->getType().isTrivial(F.getModule()),
+    require(BI->getType().isTrivial(F),
             "unchecked_trivial_bit_cast must produce a value of trivial type");
   }
 
@@ -3659,7 +3802,8 @@ public:
 
     // convert_function is required to be an ABI-compatible conversion.
     requireABICompatibleFunctionTypes(
-        opTI, resTI, "convert_function cannot change function ABI");
+        opTI, resTI, "convert_function cannot change function ABI",
+        ICI->getFunction());
   }
 
   void checkConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *ICI) {
@@ -3675,7 +3819,8 @@ public:
     // conversion once escapability is the same on both sides.
     requireABICompatibleFunctionTypes(
         opTI, resTI->getWithExtInfo(resTI->getExtInfo().withNoEscape(false)),
-        "convert_escape_to_noescape cannot change function ABI");
+        "convert_escape_to_noescape cannot change function ABI",
+        ICI->getFunction());
 
     // After mandatory passes convert_escape_to_noescape should not have the
     // '[not_guaranteed]' or '[escaped]' attributes.
@@ -4359,7 +4504,6 @@ public:
 
     bool matched = true;
     auto argI = entry->args_begin();
-    SILModule &M = F.getModule();
 
     auto check = [&](const char *what, SILType ty) {
       auto mappedTy = F.mapTypeIntoContext(ty);
@@ -4378,7 +4522,7 @@ public:
       }
 
       auto ownershipkind = ValueOwnershipKind(
-          M, mappedTy, fnConv.getSILArgumentConvention(bbarg->getIndex()));
+          F, mappedTy, fnConv.getSILArgumentConvention(bbarg->getIndex()));
 
       if (bbarg->getOwnershipKind() != ownershipkind) {
         llvm::errs() << what << " ownership kind mismatch!\n";
@@ -4982,13 +5126,8 @@ void SILVTable::verify(const SILModule &M) const {
     assert(theClass && "vtable entry must refer to a class member");
 
     // The class context must be the vtable's class, or a superclass thereof.
-    auto c = getClass();
-    do {
-      if (c == theClass)
-        break;
-      c = c->getSuperclassDecl();
-    } while (c);
-    assert(c && "vtable entry must refer to a member of the vtable's class");
+    assert(theClass->isSuperclassOf(getClass()) &&
+           "vtable entry must refer to a member of the vtable's class");
 
     // All function vtable entries must be at their natural uncurry level.
     assert(!entry.Method.isCurried && "vtable entry must not be curried");

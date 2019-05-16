@@ -771,11 +771,6 @@ static bool hasNonCanonicalSelfProtocolRequirement(
     // If we don't already have a requirement signature for this protocol,
     // build one now.
     auto inProto = source->getProtocolDecl();
-    if (!inProto->isRequirementSignatureComputed()) {
-      inProto->computeRequirementSignature();
-      assert(inProto->isRequirementSignatureComputed() &&
-             "couldn't compute requirement signature?");
-    }
 
     // Check whether the given requirement is in the requirement signature.
     if (!source->usesRequirementSignature &&
@@ -856,13 +851,9 @@ void GenericSignature::buildConformanceAccessPath(
 
       // The generic signature builder we're using for this protocol
       // wasn't built from its own requirement signature, so we can't
-      // trust it. Make sure we have a requirement signature, then build
-      // a new generic signature builder.
+      // trust it, build a new generic signature builder.
       // FIXME: It would be better if we could replace the canonical generic
       // signature builder with the rebuilt one.
-      if (!requirementSignatureProto->isRequirementSignatureComputed())
-        requirementSignatureProto->computeRequirementSignature();
-      assert(requirementSignatureProto->isRequirementSignatureComputed());
 
       replacementBuilder.emplace(getASTContext());
       replacementBuilder->addGenericSignature(
@@ -1029,8 +1020,41 @@ unsigned GenericParamKey::findIndexIn(
   return genericParams.size();
 }
 
+SubstitutionMap GenericSignature::getIdentitySubstitutionMap() const {
+  return SubstitutionMap::get(const_cast<GenericSignature*>(this),
+                              [](SubstitutableType *t) -> Type {
+                                return Type(cast<GenericTypeParamType>(t));
+                              },
+                              MakeAbstractConformanceForGenericType());
+}
+
 unsigned GenericSignature::getGenericParamOrdinal(GenericTypeParamType *param) {
   return GenericParamKey(param->getDepth(), param->getIndex())
     .findIndexIn(getGenericParams());
+}
+
+bool GenericSignature::hasTypeVariable() const {
+  return hasTypeVariable(getRequirements());
+}
+
+bool GenericSignature::hasTypeVariable(ArrayRef<Requirement> requirements) {
+  for (const auto &req : requirements) {
+    if (req.getFirstType()->hasTypeVariable())
+      return true;
+
+    switch (req.getKind()) {
+    case RequirementKind::Layout:
+      break;
+
+    case RequirementKind::Conformance:
+    case RequirementKind::SameType:
+    case RequirementKind::Superclass:
+      if (req.getSecondType()->hasTypeVariable())
+        return true;
+      break;
+    }
+  }
+
+  return false;
 }
 

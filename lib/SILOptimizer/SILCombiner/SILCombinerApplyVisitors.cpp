@@ -201,7 +201,7 @@ bool PartialApplyCombiner::allocateTemporaries() {
         return false;
 
       // If the temporary is non-trivial, we need to release it later.
-      if (!Arg->getType().isTrivial(PAI->getModule()))
+      if (!Arg->getType().isTrivial(*PAI->getFunction()))
         needsReleases = true;
       ArgsToHandle.push_back(std::make_pair(Arg, i));
     }
@@ -256,11 +256,11 @@ void PartialApplyCombiner::releaseTemporaries() {
   // its really needed.
   for (auto Op : Tmps) {
     auto TmpType = Op->getType().getObjectType();
-    if (TmpType.isTrivial(PAI->getModule()))
+    if (TmpType.isTrivial(*PAI->getFunction()))
       continue;
     for (auto *EndPoint : PAFrontier) {
       Builder.setInsertionPoint(EndPoint);
-      if (!TmpType.isAddressOnly(PAI->getModule())) {
+      if (!TmpType.isAddressOnly(*PAI->getFunction())) {
         auto *Load = Builder.createLoad(PAI->getLoc(), Op,
                                         LoadOwnershipQualifier::Unqualified);
         Builder.createReleaseValue(PAI->getLoc(), Load, Builder.getDefaultAtomicity());
@@ -663,6 +663,10 @@ void SILCombiner::replaceWitnessMethodInst(
 // This function determines concrete type of an opened existential argument
 // using ProtocolConformanceAnalysis. The concrete type of the argument can be a
 // class, struct, or an enum.
+//
+// If some ConcreteOpenedExistentialInfo is returned, then new cast instructions
+// have already been added to Builder's tracking list. If the caller can't make
+// real progress then it must reset the Builder.
 Optional<ConcreteOpenedExistentialInfo>
 SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
     Operand &ArgOperand) {
@@ -690,10 +694,18 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
   } else {
     auto ArgType = ArgOperand.get()->getType();
     auto SwiftArgType = ArgType.getASTType();
-    if (!ArgType.isExistentialType() || ArgType.isAnyObject() ||
-        SwiftArgType->isAny())
-      return None;
-    PD = dyn_cast<ProtocolDecl>(SwiftArgType->getAnyNominal());
+    /// If the argtype is an opened existential conforming to a protocol type
+    /// and that the protocol type has a sole conformance, then we can propagate
+    /// concrete type for it as well.
+    ArchetypeType *archetypeTy;
+    if (SwiftArgType->isOpenedExistential() &&
+        (archetypeTy = dyn_cast<ArchetypeType>(SwiftArgType)) &&
+        (archetypeTy->getConformsTo().size() == 1)) {
+      PD = archetypeTy->getConformsTo()[0];
+    } else if (ArgType.isExistentialType() && !ArgType.isAnyObject() &&
+               !SwiftArgType->isAny()) {
+      PD = dyn_cast<ProtocolDecl>(SwiftArgType->getAnyNominal());
+    }
   }
 
   if (!PD)
@@ -801,11 +813,12 @@ static bool canReplaceCopiedArg(FullApplySite Apply, SILValue Arg,
   if (!IEA)
     return false;
 
-  // If the witness method mutates Arg, we cannot replace Arg with
-  // the source of a copy. Otherwise the call would modify another value than
-  // the original argument.
+  // If the witness method does not take the value as guaranteed, we cannot
+  // replace Arg with the source of a copy. Otherwise the call would modify
+  // another value than the original argument (in the case of indirect mutating)
+  // or create a use-after-free (in the case of indirect consuming).
   auto origConv = Apply.getOrigCalleeConv();
-  if (origConv.getParamInfoForSILArg(ArgIdx).isIndirectMutating())
+  if (!origConv.getParamInfoForSILArg(ArgIdx).isIndirectInGuaranteed())
     return false;
 
   auto *DT = DA->get(Apply.getFunction());
@@ -990,9 +1003,15 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
         });
   }
 
-  if (!UpdatedArgs)
+  if (!UpdatedArgs) {
+    // Remove any new instructions created while attempting to optimize this
+    // apply. Since the apply was never rewritten, if they aren't removed here,
+    // they will be removed later as dead when visited by SILCombine, causing
+    // SILCombine to loop infinitely, creating and destroying the casts.
+    recursivelyDeleteTriviallyDeadInstructions(*Builder.getTrackingList());
+    Builder.getTrackingList()->clear();
     return nullptr;
-
+  }
   // Now create the new apply instruction.
   SILBuilderWithScope ApplyBuilder(Apply.getInstruction(), BuilderCtx);
   FullApplySite NewApply;
@@ -1124,6 +1143,9 @@ SILCombiner::propagateConcreteTypeOfInitExistential(FullApplySite Apply) {
   if (COEIs.empty())
     return nullptr;
 
+  // At least one COEI is present, so cast instructions may already have been
+  // inserted. We must either rewrite the apply or delete the casts and reset
+  // the Builder's tracking list.
   return createApplyWithConcreteType(Apply, COEIs, BuilderCtx);
 }
 

@@ -99,8 +99,8 @@ void SplitterStep::computeFollowupSteps(
   // FIXME: We're seeding typeVars with TypeVariables so that the
   // connected-components algorithm only considers those type variables within
   // our component. There are clearly better ways to do this.
-  SmallVector<TypeVariableType *, 16> typeVars(CS.TypeVariables);
-  SmallVector<unsigned, 16> components;
+  std::vector<TypeVariableType *> typeVars(CS.TypeVariables);
+  std::vector<unsigned> components;
   unsigned numComponents = CG.computeConnectedComponents(typeVars, components);
   if (numComponents < 2) {
     componentSteps.push_back(llvm::make_unique<ComponentStep>(
@@ -430,7 +430,9 @@ StepResult DisjunctionStep::resume(bool prevFailed) {
 bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
   auto &ctx = CS.getASTContext();
 
-  if (choice.isDisabled()) {
+  bool attemptFixes = CS.shouldAttemptFixes();
+  // Enable "fixed" overload choices in "diagnostic" mode.
+  if (!(attemptFixes && choice.hasFix()) && choice.isDisabled()) {
     if (isDebugMode()) {
       auto &log = getDebugLogger();
       log << "(skipping ";
@@ -442,7 +444,7 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
   }
 
   // Skip unavailable overloads unless solver is in the "diagnostic" mode.
-  if (!CS.shouldAttemptFixes() && choice.isUnavailable())
+  if (!attemptFixes && choice.isUnavailable())
     return true;
 
   if (ctx.LangOpts.DisableConstraintSolverPerformanceHacks)

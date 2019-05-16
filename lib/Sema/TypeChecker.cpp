@@ -334,23 +334,11 @@ static void typeCheckFunctionsAndExternalDecls(SourceFile &SF, TypeChecker &TC) 
         TC.checkFunctionErrorHandling(AFD);
         continue;
       }
-      if (auto nominal = dyn_cast<NominalTypeDecl>(decl)) {
-        (void)nominal->getAllConformances();
+      if (isa<NominalTypeDecl>(decl))
         continue;
-      }
       if (isa<VarDecl>(decl))
         continue;
       llvm_unreachable("Unhandled external definition kind");
-    }
-
-    // Complete any protocol requirement signatures that were delayed
-    // because the protocol was validated via validateDeclForNameLookup().
-    while (!TC.DelayedRequirementSignatures.empty()) {
-      auto decl = TC.DelayedRequirementSignatures.pop_back_val();
-      if (decl->isInvalid() || TC.Context.hadError())
-        continue;
-
-      TC.validateDecl(decl);
     }
 
     // Validate any referenced declarations for SIL's purposes.
@@ -400,7 +388,6 @@ static void typeCheckFunctionsAndExternalDecls(SourceFile &SF, TypeChecker &TC) 
            currentSynthesizedDecl < SF.SynthesizedDecls.size() ||
            TC.NextDeclToFinalize < TC.DeclsToFinalize.size() ||
            !TC.ConformanceContexts.empty() ||
-           !TC.DelayedRequirementSignatures.empty() ||
            !TC.UsedConformances.empty() ||
            !TC.PartiallyCheckedConformances.empty());
 
@@ -460,6 +447,7 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
     return;
 
   auto &Ctx = SF.getASTContext();
+  BufferIndirectlyCausingDiagnosticRAII cpr(SF);
 
   // Make sure we have a type checker.
   TypeChecker &TC = createTypeChecker(Ctx);
@@ -509,20 +497,14 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
     checkBridgedFunctions(TC.Context);
 
     // Type check the top-level elements of the source file.
-    bool hasTopLevelCode = false;
     for (auto D : llvm::makeArrayRef(SF.Decls).slice(StartElem)) {
       if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
-        hasTopLevelCode = true;
         // Immediately perform global name-binding etc.
         TC.typeCheckTopLevelCodeDecl(TLCD);
+        TC.contextualizeTopLevelCode(TLC, TLCD);
       } else {
         TC.typeCheckDecl(D);
       }
-    }
-
-    if (hasTopLevelCode) {
-      TC.contextualizeTopLevelCode(TLC,
-                             llvm::makeArrayRef(SF.Decls).slice(StartElem));
     }
 
     // If we're in REPL mode, inject temporary result variables and other stuff
@@ -570,10 +552,10 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
 void swift::performWholeModuleTypeChecking(SourceFile &SF) {
   auto &Ctx = SF.getASTContext();
   FrontendStatsTracer tracer(Ctx.Stats, "perform-whole-module-type-checking");
-  Ctx.diagnoseAttrsRequiringFoundation(SF);
-  Ctx.diagnoseObjCMethodConflicts(SF);
-  Ctx.diagnoseObjCUnsatisfiedOptReqConflicts(SF);
-  Ctx.diagnoseUnintendedObjCMethodOverrides(SF);
+  diagnoseAttrsRequiringFoundation(SF);
+  diagnoseObjCMethodConflicts(SF);
+  diagnoseObjCUnsatisfiedOptReqConflicts(SF);
+  diagnoseUnintendedObjCMethodOverrides(SF);
 
   // In whole-module mode, import verification is deferred until all files have
   // been type checked. This avoids caching imported declarations when a valid
@@ -643,6 +625,17 @@ void swift::typeCheckCompletionDecl(Decl *D) {
     TC.validateExtension(ext);
   else
     TC.validateDecl(cast<ValueDecl>(D));
+}
+
+void swift::typeCheckPatternBinding(PatternBindingDecl *PBD,
+                                    unsigned bindingIndex) {
+  assert(!PBD->isInitializerChecked(bindingIndex) &&
+         PBD->getInit(bindingIndex));
+
+  auto &Ctx = PBD->getASTContext();
+  DiagnosticSuppression suppression(Ctx.Diags);
+  TypeChecker &TC = createTypeChecker(Ctx);
+  TC.typeCheckPatternBinding(PBD, bindingIndex);
 }
 
 static Optional<Type> getTypeOfCompletionContextExpr(

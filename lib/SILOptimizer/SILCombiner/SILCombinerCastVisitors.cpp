@@ -265,11 +265,11 @@ SILCombiner::visitBridgeObjectToRefInst(BridgeObjectToRefInst *BORI) {
 SILInstruction *
 SILCombiner::visitUncheckedRefCastAddrInst(UncheckedRefCastAddrInst *URCI) {
   SILType SrcTy = URCI->getSrc()->getType();
-  if (!SrcTy.isLoadable(URCI->getModule()))
+  if (!SrcTy.isLoadable(*URCI->getFunction()))
     return nullptr;
 
   SILType DestTy = URCI->getDest()->getType();
-  if (!DestTy.isLoadable(URCI->getModule()))
+  if (!DestTy.isLoadable(*URCI->getFunction()))
     return nullptr;
 
   // After promoting unchecked_ref_cast_addr to unchecked_ref_cast, the SIL
@@ -386,7 +386,7 @@ visitUncheckedBitwiseCastInst(UncheckedBitwiseCastInst *UBCI) {
     return Builder.createUncheckedBitwiseCast(UBCI->getLoc(), Oper,
                                               UBCI->getType());
   }
-  if (UBCI->getType().isTrivial(UBCI->getModule()))
+  if (UBCI->getType().isTrivial(*UBCI->getFunction()))
     return Builder.createUncheckedTrivialBitCast(UBCI->getLoc(),
                                                  UBCI->getOperand(),
                                                  UBCI->getType());
